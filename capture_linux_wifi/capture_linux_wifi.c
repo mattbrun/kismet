@@ -168,6 +168,21 @@ typedef struct {
     unsigned int center_freq2;
 } local_channel_t;
 
+int driver_is_rtl8188eu(kis_capture_handler_t *caph) { // add by CyBrain
+	char driver[32];
+	local_wifi_t *local_wifi = (local_wifi_t *) caph->userdata;
+	linux_getsysdrv(local_wifi->interface, driver);
+	if (strcmp(driver, "rtl8188eu") == 0) return 1;
+	return 0;
+}
+
+int mode_is_monitor(kis_capture_handler_t *caph, int mode) { // add by CyBrain
+	#define LINUX_WLEXT_AUTO 0	// See kernel driver IW_MODE_AUTO
+	if (mode == LINUX_WLEXT_MONITOR) return 1;
+	if (driver_is_rtl8188eu(caph) && mode == LINUX_WLEXT_AUTO) return 1;
+	return 0;
+}
+
 unsigned int wifi_chan_to_freq(unsigned int in_chan) {
     /* 802.11 channels to frequency; if it looks like a frequency, return as
      * pure frequency; derived from iwconfig */
@@ -585,7 +600,7 @@ int chancontrol_callback(kis_capture_handler_t *caph, uint32_t seqno, void *priv
         return 0;
     }
 
-    if (!local_wifi->use_mac80211_channels) {
+    if (!local_wifi->use_mac80211_channels || driver_is_rtl8188eu(caph)) {	// mod by CyBrain
         if ((r = iwconfig_set_channel(local_wifi->interface, 
                         channel->control_freq, errstr)) < 0) {
             /* Sometimes tuning a channel fails; this is only a problem if we fail
@@ -904,7 +919,19 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
     *uuid = strdup(errstr);
 
     /* Look up the driver and set any special attributes */
-    if (strcmp(driver, "8812au") == 0) {
+    snprintf(errstr, STATUS_MAX, "***CyBrain*** %s %s@%u driver='%s' driver_is_rtl8188eu=%d", __TIME__, __FILE__, __LINE__
+	, driver, driver_is_rtl8188eu(caph));
+    cf_send_message(caph, errstr, MSGFLAG_INFO);
+    if (driver_is_rtl8188eu(caph)) {	// add by CyBrain
+        snprintf(errstr, STATUS_MAX, "Interface '%s' looks to use the 8188eu driver, "
+            "which has problems using mac80211 VIF mode.  Disabling mac80211 VIF "
+	    "creation but retaining mac80211 channel controls.", 
+	    local_wifi->interface);
+        cf_send_warning(caph, errstr, MSGFLAG_INFO, errstr);
+
+        local_wifi->use_mac80211_vif = 0;
+    }
+    else if (strcmp(driver, "8812au") == 0) {
         snprintf(errstr, STATUS_MAX, "Interface '%s' looks to use the 8812au driver, "
                 "which has problems using mac80211 VIF mode.  Disabling mac80211 VIF "
                 "creation but retaining mac80211 channel controls.", 
@@ -1067,9 +1094,9 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
                 /* We need to check the mode here to make sure we're not in a weird
                  * state where NM retyped our interface or something */
                 if (iwconfig_get_mode(ifnam, errstr, &mode) >= 0) {
-                    if (mode != LINUX_WLEXT_MONITOR) {
+                    if (!mode_is_monitor(caph, mode)) {	// mod by CyBrain
                         snprintf(msg, STATUS_MAX, "A monitor vif already exists "
-                                "for interface '%s' (%s) but isn't in monitor mode, "
+                                "for interface '%s' (%s) but isn't in monitor/auto mode, "
                                 "check that NetworkManager isn't hijacking the "
                                 "interface, delete the false monitor vif, and try "
                                 "again.", local_wifi->interface, ifnam);
@@ -1120,7 +1147,7 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
      * doesn't exist - so try to make a monitor vif via mac80211; this will 
      * work with all modern drivers and we'd definitely rather do this.
      */
-    if (mode != LINUX_WLEXT_MONITOR && local_wifi->use_mac80211_vif &&
+    if (!mode_is_monitor(caph, mode) && local_wifi->use_mac80211_vif &&	// mod by CyBrain
             strcmp(local_wifi->interface, local_wifi->cap_interface) != 0) {
         /* First, look for some nl80211 flags in the arguments. */
         unsigned int num_flags = 2;
@@ -1215,7 +1242,7 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
         }
 
         free(flags);
-    } else if (mode != LINUX_WLEXT_MONITOR) {
+    } else if (!mode_is_monitor(caph, mode)) {	// mod by CyBrain
         /* Otherwise we want monitor mode but we don't have nl / found the same vif */
 
         /* fprintf(stderr, "debug - bringing down cap interface %s to set mode\n", local_wifi->cap_interface); */
@@ -1269,7 +1296,7 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
     }
 
     if (iwconfig_get_mode(local_wifi->cap_interface, errstr, &mode) < 0 ||
-            mode != LINUX_WLEXT_MONITOR) {
+            !mode_is_monitor(caph, mode)) {	// mod by CyBrain
         snprintf(msg, STATUS_MAX, "Capture interface '%s' did not enter monitor "
                 "mode, something is wrong.", local_wifi->cap_interface);
         return -1;
